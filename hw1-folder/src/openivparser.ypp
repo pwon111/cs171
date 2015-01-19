@@ -1,0 +1,272 @@
+/* CS/CNS 171 Fall 2014
+ *
+ * This is the parser that parses an Open Inventor file and stores the data
+ * in an IVData struct.
+ *
+ * We recommend that you avoid editing this file unless you really know your
+ * way around the flex/bison syntax and feel a compelling need to change our
+ * code. Keep in mind that we will be giving you updated versions of this parser
+ * in the later assignments, so any changes you make here will have to be made
+ * again to the later versions that we give you.
+ */
+
+%{
+#include <Eigen/Eigen>
+#include <FlexLexer.h>
+#include <iostream>
+#include <vector>
+#include "ivdata.h"
+#include "util.h"
+
+using namespace Eigen;
+using namespace std;
+
+/* Notifies the compiler of the extern functions from flex. We do not need
+ * to define these functions. */
+extern int openivlex();
+extern void openivlex_destroy();
+
+/* Error function for parse errors. We define this later. */
+int openiverror(const char *s);
+
+static Camera camera; /* For the camera block. */
+
+/* This vector is for the Separator blocks. We will push an Object struct
+ * into the vector for each Separator block in the file in the order they
+ * appear. The last Object in the vector always corresponds to the most
+ * recently read Separator block in the file. */
+static vector<Object> objects;
+%}
+
+/* Since bison will always generate a file called "yyparser.ypp" by default,
+ * we set a prefix to differentiate the parser file this will generate from
+ * the other, potential parser files in the same directory. The prefix replaces
+ * the "yy" for every associated file, variable, and function.
+ * e.g. yyparser.ypp will be openivparser.ypp and yylex() will be openivlex(). */
+%name-prefix "openiv"
+/* Setting to get more detailed errors. */
+%error-verbose
+
+%union
+{
+    float fval;
+    int ival;
+}
+
+%defines
+
+%token <ival> INT
+%token <ival> TERMINATOR
+%token <fval> FLOAT
+
+%token OPEN_BRACE
+%token CLOSE_BRACE
+%token OPEN_BRACKET
+%token CLOSE_BRACKET
+
+%token COMMA
+
+%token CAMERA
+%token CAM_POSITION
+%token CAM_ORIENTATION
+%token CAM_NEAR
+%token CAM_FAR
+%token CAM_LEFT
+%token CAM_RIGHT
+%token CAM_TOP
+%token CAM_BOTTOM
+
+%token SEPARATOR
+
+%token TRANSFORM
+%token TRANSLATE
+%token ROTATE
+%token SCALE
+
+%token COORDINATE
+%token POINT
+%token FACESET
+%token COORDINATE_INDEX
+
+%%
+/* The following parser code is for the most part self-explanatory with some
+ * knowledge of the bison syntax. We're basically just setting the fields of
+ * our Camera and Object structs to the appropriate numbers given in the Open
+ * Inventor file. */
+
+ivfile : blocks;
+
+blocks : block | block blocks;
+
+block : cam_block | sep_block;
+
+cam_block : CAMERA OPEN_BRACE cam_data CLOSE_BRACE;
+
+cam_data : cam_line | cam_line cam_data;
+
+cam_line : CAM_POSITION FLOAT FLOAT FLOAT
+           { camera.position << $2, $3, $4; }
+           |
+           CAM_ORIENTATION FLOAT FLOAT FLOAT FLOAT
+           { camera.orientation_axis << $2, $3, $4;
+             camera.orientation_angle = $5;
+           }
+           |
+           CAM_NEAR FLOAT
+           { camera.near = $2; }
+           |
+           CAM_FAR FLOAT
+           { camera.far = $2; }
+           |
+           CAM_LEFT FLOAT
+           { camera.left = $2; }
+           |
+           CAM_RIGHT FLOAT
+           { camera.right = $2; }
+           |
+           CAM_TOP FLOAT
+           { camera.top = $2; }
+           |
+           CAM_BOTTOM FLOAT
+           { camera.bottom = $2; }
+           ;
+
+sep_block : sep_init OPEN_BRACE sep_data CLOSE_BRACE;
+
+sep_init : SEPARATOR
+           { /* We've hit the start of a new Separator block, so we should
+              * push a new Object to represent the block into our vector. We
+              * can access this Object easily via objects.back() since it
+              * will be the last element of the vector until we hit the next
+              * Separator block in the file (at which point, we would be done
+              * with this current Separator block and have no more need to edit
+              * the corresponding Object struct.) */
+             Object object;
+             objects.push_back(object);
+           }
+           ;
+
+sep_data : sep_line | sep_line sep_data;
+
+sep_line : transform_block | coordinate_block | faceset_block;
+
+transform_block : TRANSFORM OPEN_BRACE transform_data CLOSE_BRACE
+
+transform_data : transform_line | transform_line transform_data;
+
+transform_line : TRANSLATE FLOAT FLOAT FLOAT
+                 { MatrixXd translate_mat = get_translate_mat($2, $3, $4);
+                   objects.back().transforms.push_back(translate_mat);
+                 }
+                 |
+                 ROTATE FLOAT FLOAT FLOAT FLOAT
+                 { MatrixXd rotate_mat = get_rotate_mat($2, $3, $4, $5);
+                   objects.back().transforms.push_back(rotate_mat);
+                 }
+                 |
+                 SCALE FLOAT FLOAT FLOAT
+                 { MatrixXd scale_mat = get_scale_mat($2, $3, $4);
+                   objects.back().transforms.push_back(scale_mat);
+                 }
+                 ;
+
+coordinate_block : COORDINATE OPEN_BRACE coordinate_data CLOSE_BRACE;
+
+coordinate_data : POINT OPEN_BRACKET points CLOSE_BRACKET;
+
+points : FLOAT FLOAT FLOAT
+         { Point point;
+           point.x = $1;
+           point.y = $2;
+           point.z = $3;
+           point.w = 1;
+           objects.back().points.push_back(point);
+         }
+         |
+         points COMMA FLOAT FLOAT FLOAT
+         { Point point;
+           point.x = $3;
+           point.y = $4;
+           point.z = $5;
+           point.w = 1;
+           objects.back().points.push_back(point);
+         }
+         ;
+
+faceset_block : FACESET OPEN_BRACE faceset_init index_list CLOSE_BRACE;
+
+faceset_init: COORDINATE_INDEX
+              { /* A COORDINATE_INDEX token indicates that we are about to
+                 * read "facesets" from the file. In order to store the first
+                 * faceset in our Object struct, we need to initialize our
+                 * 'facesets' vector by pushing into it an empty 'faceset'
+                 * vector. We will then push the indices that we read next
+                 * from the file into this faceset vector until we hit a -1,
+                 * which indicates the end of a faceset. At that point, we push
+                 * on a new 'faceset' vector into 'facesets' and push the
+                 * indices for the next faceset into this new 'faceset' vector.
+                 * The most current faceset will always be represented by
+                 * the last vector in 'facesets', letting us easily access it
+                 * via facesets.back(). */
+                vector<int> faceset;
+                objects.back().facesets.push_back(faceset);
+              }
+              ;
+
+index_list : OPEN_BRACKET index CLOSE_BRACKET;
+
+index : INT
+        { objects.back().facesets.back().push_back($1); }
+        |
+        index COMMA INT
+        { objects.back().facesets.back().push_back($3); }
+        |
+        index COMMA TERMINATOR
+        { /* We've hit a -1, so we push in a new 'faceset' vector for the next
+           * faceset. If there is no next faceset, then we will end up pushing
+           * in a vector that will remain empty. We will need to get rid of this
+           * empty vector for convenience later in the 'parse_iv' function. */
+          vector<int> faceset;
+          objects.back().facesets.push_back(faceset);
+        }
+        ;
+
+%%
+
+/* Straight-forward error printing function for parse errors. */
+int openiverror(const char *s)
+{
+    cerr << "\nParser error: " << s << endl;
+    openivlex_destroy();
+    exit(1);
+}
+
+/* The parse function that will be called in the .cpp file. It will parse
+ * the Open Inventor file that gets piped into the compiled program and
+ * format the data in the file appropriately in an IVData struct. The
+ * IVData struct is returned by this function. */
+IVData parse_iv(istream &datafile)
+{
+    if(openivparse()) /* If our parsing fails. */
+    {
+        cerr << "\nParse failed!" << endl;
+        openivlex_destroy();
+        exit(1);
+    }
+    
+    openivlex_destroy();
+    
+    int num_objects = objects.size();
+    
+    /* We need to delete the last element of each 'facesets' vector since
+     * we have extraneous, empty vectors at the end of each one due to the
+     * way we parsed the -1 terminators. */
+    for(int i = 0; i < num_objects; ++i)
+        objects[i].facesets.pop_back();
+    
+    IVData data;
+    data.camera = camera;
+    data.objects = objects;
+    
+    return data;
+}
